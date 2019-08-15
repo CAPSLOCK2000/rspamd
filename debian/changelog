@@ -1,4 +1,10 @@
-rspamd (1.9.4-1~buster+uvt1) unstable; urgency=medium
+rspamd (1.9.4~buster+uvt2) unstable; urgency=medium
+
+  * Rebuild with fixes from upstream.
+
+ -- Casper Gielen (Unix Administrator University Tilburg) <cgielen@uvt.nl>  Thu, 15 Aug 2019 16:39:23 +0200
+
+rspamd (1.9.4~buster+uvt1) unstable; urgency=medium
 
   * Fix parsing of IPv6-adresses of Redis masters & slaves.
 
