@@ -151,6 +151,18 @@ context("Selectors test", function()
                 selector = "emails",
                 expect = {{"mailto://test@example.net"}}},
 
+    ["specific_urls"] = {
+      selector = "specific_urls({limit = 1})",
+      expect = {{"http://example.net"}}},
+
+    ["specific_urls + emails"] = {
+      selector = "specific_urls({need_emails = true, limit = 2})",
+      expect = {{"http://example.net", "mailto://test@example.net"}}},
+
+    ["specific_urls + emails limit"] = {
+      selector = "specific_urls({need_emails = true, limit = 1})",
+      expect = {{"mailto://test@example.net"}}},
+
     ["pool_var str, default type"] = {
                 selector = [[pool_var("str_var")]],
                 expect = {"str 1"}},
@@ -250,6 +262,10 @@ context("Selectors test", function()
     ["map filter"] = {
       selector = "id('key').filter_map(test_map)",
       expect = {'key'}
+    },
+    ["map except"] = {
+      selector = "list('key', 'key1', 'key2', 'key3', 'key4').except_map(test_map)",
+      expect = {{'key2', 'key4'}}
     },
     ["map apply"] = {
       selector = "id('key').apply_map(test_map)",

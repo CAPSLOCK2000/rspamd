@@ -619,6 +619,216 @@ end
 exports.override_defaults = override_defaults
 
 --[[[
+-- @function lua_util.filter_specific_urls(urls, params)
+-- params: {
+- - task - if needed to save in the cache
+- - limit <int> (default = 9999)
+- - esld_limit <int> (default = 9999) n domains per eSLD (effective second level domain)
+                                      works only if number of unique eSLD less than `limit`
+- - need_emails <bool> (default = false)
+- - filter <callback> (default = nil)
+- - prefix <string> cache prefix (default = nil)
+-- }
+-- Apply heuristic in extracting of urls from `urls` table, this function
+-- tries its best to extract specific number of urls from a task based on
+-- their characteristics
+--]]
+exports.filter_specific_urls = function (urls, params)
+  local cache_key
+
+  if params.task and not params.no_cache then
+    if params.prefix then
+      cache_key = params.prefix
+    else
+      cache_key = string.format('sp_urls_%d%s', params.limit,
+          tostring(params.need_emails or false))
+    end
+    local cached = params.task:cache_get(cache_key)
+
+    if cached then
+      return cached
+    end
+  end
+
+  if not urls then return {} end
+
+  if params.filter then urls = fun.totable(fun.filter(params.filter, urls)) end
+
+  if #urls <= params.limit and #urls <= params.esld_limit then
+    if params.task and not params.no_cache then
+      params.task:cache_set(cache_key, urls)
+    end
+
+    return urls
+  end
+
+  -- Filter by tld:
+  local tlds = {}
+  local eslds = {}
+  local ntlds, neslds = 0, 0
+
+  local res = {}
+  local nres = 0
+
+  local function insert_url(str, u)
+    if not res[str] then
+      res[str] = u
+      nres = nres + 1
+
+      return true
+    end
+
+    return false
+  end
+
+  local function process_single_url(u, default_priority)
+    local priority = default_priority or 1 -- Normal priority
+
+    if u:is_redirected() then
+      local redir = u:get_redirected() -- get the real url
+
+      if params.ignore_redirected then
+        -- Replace `u` with redir
+        u = redir
+        priority = 2
+      else
+        -- Process both redirected url and the original one
+        process_single_url(redir, 2)
+      end
+    end
+
+    local esld = u:get_tld()
+    local str_hash = tostring(u)
+
+    if esld then
+      -- Special cases
+      if (u:get_protocol() ~= 'mailto') and (not u:is_html_displayed()) then
+        if u:is_obscured() then
+          priority = 3
+        else
+          if u:get_user() then
+            priority = 2
+          elseif u:is_subject() or u:is_phished() then
+            priority = 2
+          end
+        end
+      elseif u:is_html_displayed() then
+        priority = 0
+      end
+
+      if not eslds[esld] then
+        eslds[esld] = {{str_hash, u, priority}}
+        neslds = neslds + 1
+      else
+        if #eslds[esld] < params.esld_limit then
+          table.insert(eslds[esld], {str_hash, u, priority})
+        end
+      end
+
+
+      -- eSLD - 1 part => tld
+      local parts = rspamd_str_split(esld, '.')
+      local tld = table.concat(fun.totable(fun.tail(parts)), '.')
+
+      if not tlds[tld] then
+        tlds[tld] = {{str_hash, u, priority}}
+        ntlds = ntlds + 1
+      else
+        table.insert(tlds[tld], {str_hash, u, priority})
+      end
+    end
+  end
+
+  for _,u in ipairs(urls) do
+    process_single_url(u)
+  end
+
+  local limit = params.limit
+  limit = limit - nres
+  if limit < 0 then limit = 0 end
+
+  if limit == 0 then
+    res = exports.values(res)
+    if params.task and not params.no_cache then
+      params.task:cache_set(cache_key, res)
+    end
+    return res
+  end
+
+  -- Sort eSLDs and tlds
+  local function sort_stuff(tbl)
+    -- Sort according to max priority
+    table.sort(tbl, function(e1, e2)
+      -- Sort by priority so max priority is at the end
+      table.sort(e1, function(tr1, tr2)
+        return tr1[3] < tr2[3]
+      end)
+      table.sort(e2, function(tr1, tr2)
+        return tr1[3] < tr2[3]
+      end)
+
+      if e1[#e1][3] ~= e2[#e2][3] then
+        -- Sort by priority so max priority is at the beginning
+        return e1[#e1][3] > e2[#e2][3]
+      else
+        -- Prefer less urls to more urls per esld
+        return #e1 < #e2
+      end
+
+    end)
+
+    return tbl
+  end
+
+  eslds = sort_stuff(exports.values(eslds))
+  neslds = #eslds
+
+  if neslds <= limit then
+    -- Number of eslds < limit
+    repeat
+      local item_found = false
+
+      for _,lurls in ipairs(eslds) do
+        if #lurls > 0 then
+          local last = table.remove(lurls)
+          insert_url(last[1], last[2])
+          limit = limit - 1
+          item_found = true
+        end
+      end
+
+    until limit <= 0 or not item_found
+
+    res = exports.values(res)
+    if params.task and not params.no_cache then
+      params.task:cache_set(cache_key, res)
+    end
+    return res
+  end
+
+  tlds = sort_stuff(exports.values(tlds))
+  ntlds = #tlds
+
+  -- Number of tlds < limit
+  while limit > 0 do
+    for _,lurls in ipairs(tlds) do
+      if #lurls > 0 then
+        local last = table.remove(lurls)
+        insert_url(last[1], last[2])
+        limit = limit - 1
+      end
+      if limit == 0 then break end
+    end
+  end
+
+  res = exports.values(res)
+  if params.task and not params.no_cache then
+    params.task:cache_set(cache_key, res)
+  end
+  return res
+end
+
+--[[[
 -- @function lua_util.extract_specific_urls(params)
 -- params: {
 - - task
@@ -628,6 +838,7 @@ exports.override_defaults = override_defaults
 - - need_emails <bool> (default = false)
 - - filter <callback> (default = nil)
 - - prefix <string> cache prefix (default = nil)
+- - ignore_redirected <bool> (default = false)
 -- }
 -- Apply heuristic in extracting of urls from task, this function
 -- tries its best to extract specific number of urls from a task based on
@@ -640,7 +851,9 @@ exports.extract_specific_urls = function(params_or_task, lim, need_emails, filte
     esld_limit = 9999,
     need_emails = false,
     filter = nil,
-    prefix = nil
+    prefix = nil,
+    ignore_redirected = false,
+    no_cache = false,
   }
 
   local params
@@ -660,143 +873,9 @@ exports.extract_specific_urls = function(params_or_task, lim, need_emails, filte
     if not params[k] then params[k] = v end
   end
 
-
-  local cache_key
-
-  if params.prefix then
-    cache_key = params.prefix
-  else
-    cache_key = string.format('sp_urls_%d%s', params.limit,
-        tostring(params.need_emails))
-  end
-
-
-  local cached = params.task:cache_get(cache_key)
-
-  if cached then
-    return cached
-  end
-
   local urls = params.task:get_urls(params.need_emails)
 
-  if not urls then return {} end
-
-  if params.filter then urls = fun.totable(fun.filter(params.filter, urls)) end
-
-  if #urls <= params.limit and #urls <= params.esld_limit then
-    params.task:cache_set(cache_key, urls)
-    return urls
-  end
-
-  -- Filter by tld:
-  local tlds = {}
-  local eslds = {}
-  local ntlds, neslds = 0, 0
-
-  local res = {}
-
-  for _,u in ipairs(urls) do
-    local esld = u:get_tld()
-
-    if esld then
-      if not eslds[esld] then
-        eslds[esld] = {u}
-        neslds = neslds + 1
-      else
-        if #eslds[esld] < params.esld_limit then
-          table.insert(eslds[esld], u)
-        end
-      end
-
-      local parts = rspamd_str_split(esld, '.')
-      local tld = table.concat(fun.totable(fun.tail(parts)), '.')
-
-      if not tlds[tld] then
-        tlds[tld] = {u}
-        ntlds = ntlds + 1
-      else
-        table.insert(tlds[tld], u)
-      end
-
-      -- Extract priority urls that are proven to be malicious
-      if not u:is_html_displayed() then
-        if u:is_obscured() then
-          table.insert(res, u)
-        else
-          if u:get_user() then
-            table.insert(res, u)
-          elseif u:is_subject() or u:is_phished() then
-            table.insert(res, u)
-          end
-        end
-      end
-    end
-  end
-
-  local limit = params.limit
-  limit = limit - #res
-  if limit <= 0 then limit = 1 end
-
-  if neslds <= limit then
-    -- We can get urls based on their eslds
-    repeat
-      local item_found = false
-
-      for _,lurls in pairs(eslds) do
-        if #lurls > 0 then
-          table.insert(res, table.remove(lurls))
-          limit = limit - 1
-          item_found = true
-        end
-      end
-
-    until limit <= 0 or not item_found
-
-    params.task:cache_set(cache_key, urls)
-    return res
-  end
-
-  if ntlds <= limit then
-    while limit > 0 do
-      for _,lurls in pairs(tlds) do
-        if #lurls > 0 then
-          table.insert(res, table.remove(lurls))
-          limit = limit - 1
-        end
-      end
-    end
-
-    params.task:cache_set(cache_key, urls)
-    return res
-  end
-
-  -- We need to sort tlds table first
-  local tlds_keys = {}
-  for k,_ in pairs(tlds) do table.insert(tlds_keys, k) end
-  table.sort(tlds_keys, function (t1, t2)
-    return #tlds[t1] < #tlds[t2]
-  end)
-
-  ntlds = #tlds_keys
-  for i=1,ntlds / 2 do
-    local tld1 = tlds[tlds_keys[i]]
-    local tld2 = tlds[tlds_keys[ntlds - i]]
-    if #tld1 > 0 then
-      table.insert(res, table.remove(tld1))
-      limit = limit - 1
-    end
-    if #tld2 > 0 then
-      table.insert(res, table.remove(tld2))
-      limit = limit - 1
-    end
-
-    if limit <= 0 then
-      break
-    end
-  end
-
-  params.task:cache_set(cache_key, urls)
-  return res
+  return exports.filter_specific_urls(urls, params)
 end
 
 --[[[
@@ -1127,6 +1206,41 @@ exports.table_digest = function(t)
     end
   end
  return h:base32()
+end
+
+---[[[
+-- @function lua_util.toboolean(v)
+-- Converts a string or a number to boolean
+-- @param {string|number} v
+-- @return {boolean} v converted to boolean
+--]]]
+exports.toboolean = function(v)
+  local true_t = {
+    ['1'] = true,
+    ['true'] = true,
+    ['TRUE'] = true,
+    ['True'] = true,
+  };
+  local false_t = {
+    ['0'] = false,
+    ['false'] = false,
+    ['FALSE'] = false,
+    ['False'] = false,
+  };
+
+  if type(v) == 'string' then
+    if true_t[v] == true then
+      return true;
+    elseif false_t[v] == false then
+      return false;
+    else
+      return false, string.format( 'cannot convert %q to boolean', v);
+    end
+  elseif type(v) == 'number' then
+    return (not (v == 0))
+  else
+    return false, string.format( 'cannot convert %q to boolean', v);
+  end
 end
 
 return exports

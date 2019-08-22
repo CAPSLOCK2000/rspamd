@@ -39,6 +39,7 @@ local settings = {}
 local N = "settings"
 local settings_initialized = false
 local max_pri = 0
+local module_sym_id -- Main module symbol
 
 local function apply_settings(task, to_apply, id)
   task:set_settings(to_apply)
@@ -98,11 +99,17 @@ end
 -- settings are overridden
 local function check_query_settings(task)
   -- Try 'settings' attribute
+  local settings_id = task:get_settings_id()
   local query_set = task:get_request_header('settings')
   if query_set then
+
     local parser = ucl.parser()
     local res,err = parser:parse_string(tostring(query_set))
     if res then
+      if settings_id then
+        rspamd_logger.warnx(task, "both settings-id '%s' and settings headers are presented, ignore settings-id; ",
+            tostring(settings_id))
+      end
       local settings_obj = parser:get_object()
       apply_settings(task, settings_obj, nil)
 
@@ -113,7 +120,6 @@ local function check_query_settings(task)
   end
 
   local query_maxscore = task:get_request_header('maxscore')
-  local settings_id = task:get_settings_id()
   local nset
 
   if query_maxscore then
@@ -918,20 +924,22 @@ local function process_settings_table(tbl, allow_ids, mempool)
             name, elt.id, out.id)
       end
 
-      if elt.apply.symbols then
+      if elt.apply and elt.apply.symbols then
         -- Register virtual symbols
         for k,v in pairs(elt.apply.symbols) do
+          local rtb = {
+            type = 'virtual',
+            parent = module_sym_id,
+          }
           if type(k) == 'number' and type(v) == 'string' then
-            rspamd_config:register_symbol{
-              name = v,
-              type = 'virtual,ghost',
-            }
+            rtb.name = v
           elseif type(k) == 'string' then
-            rspamd_config:register_symbol{
-              name = k,
-              type = 'virtual,ghost',
-            }
+            rtb.name = k
           end
+          if out.id then
+            rtb.allowed_ids = tostring(elt.id)
+          end
+          rspamd_config:register_symbol(rtb)
         end
       end
     else
@@ -1098,6 +1106,14 @@ if redis_section then
   end, redis_key_handlers)
 end
 
+module_sym_id = rspamd_config:register_symbol({
+  name = 'SETTINGS_CHECK',
+  type = 'prefilter',
+  callback = check_settings,
+  priority = 10,
+  flags = 'empty,nostat,explicit_disable,ignore_passthrough',
+})
+
 local set_section = rspamd_config:get_all_opt("settings")
 
 if set_section and set_section[1] and type(set_section[1]) == "string" then
@@ -1109,14 +1125,6 @@ elseif set_section and type(set_section) == "table" then
   settings_map_pool = rspamd_mempool.create()
   process_settings_table(set_section, true, settings_map_pool)
 end
-
-rspamd_config:register_symbol({
-  name = 'SETTINGS_CHECK',
-  type = 'prefilter',
-  callback = check_settings,
-  priority = 10,
-  flags = 'empty,nostat,explicit_disable,ignore_passthrough',
-})
 
 rspamd_config:add_config_unload(function()
   if settings_map_pool then

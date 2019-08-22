@@ -161,6 +161,7 @@ struct rspamd_symcache {
 	GPtrArray *items_by_id;
 	struct symcache_order *items_by_order;
 	GPtrArray *filters;
+	GPtrArray *prefilters_empty;
 	GPtrArray *prefilters;
 	GPtrArray *postfilters;
 	GPtrArray *composites;
@@ -192,9 +193,10 @@ struct rspamd_symcache_dynamic_item {
 
 
 struct cache_dependency {
-	struct rspamd_symcache_item *item;
-	gchar *sym;
-	gint id;
+	struct rspamd_symcache_item *item; /* Real dependency */
+	gchar *sym; /* Symbolic dep name */
+	gint id; /* Real from */
+	gint vid; /* Virtual from */
 };
 
 struct delayed_cache_dependency {
@@ -208,18 +210,7 @@ struct delayed_cache_condition {
 	lua_State *L;
 };
 
-enum rspamd_cache_savepoint_stage {
-	RSPAMD_CACHE_PASS_INIT = 0,
-	RSPAMD_CACHE_PASS_PREFILTERS,
-	RSPAMD_CACHE_PASS_FILTERS,
-	RSPAMD_CACHE_PASS_POSTFILTERS,
-	RSPAMD_CACHE_PASS_IDEMPOTENT,
-	RSPAMD_CACHE_PASS_WAIT_IDEMPOTENT,
-	RSPAMD_CACHE_PASS_DONE,
-};
-
 struct cache_savepoint {
-	enum rspamd_cache_savepoint_stage pass;
 	guint version;
 	guint items_inflight;
 	gboolean profile;
@@ -543,12 +534,144 @@ rspamd_symcache_resort (struct rspamd_symcache *cache)
 	cache->items_by_order = ord;
 }
 
+static void
+rspamd_symcache_propagate_dep (struct rspamd_symcache *cache,
+							   struct rspamd_symcache_item *it,
+							   struct rspamd_symcache_item *dit)
+{
+	const guint *ids;
+	guint nids = 0;
+
+	msg_debug_cache ("check id propagation for dependency %s from %s",
+			it->symbol, dit->symbol);
+	ids = rspamd_symcache_get_allowed_settings_ids (cache, dit->symbol, &nids);
+
+	/* TODO: merge? */
+	if (nids > 0) {
+		msg_info_cache ("propagate allowed ids from %s to %s",
+				dit->symbol, it->symbol);
+
+		rspamd_symcache_set_allowed_settings_ids (cache, it->symbol, ids,
+				nids);
+	}
+
+	ids = rspamd_symcache_get_forbidden_settings_ids (cache, dit->symbol, &nids);
+
+	if (nids > 0) {
+		msg_info_cache ("propagate forbidden ids from %s to %s",
+				dit->symbol, it->symbol);
+
+		rspamd_symcache_set_forbidden_settings_ids (cache, it->symbol, ids,
+				nids);
+	}
+}
+
+static void
+rspamd_symcache_process_dep (struct rspamd_symcache *cache,
+							 struct rspamd_symcache_item *it,
+							 struct cache_dependency *dep)
+{
+	struct rspamd_symcache_item *dit = NULL, *vdit = NULL;
+	struct cache_dependency *rdep;
+
+	if (dep->id >= 0) {
+		msg_debug_cache ("process real dependency %s on %s", it->symbol, dep->sym);
+		dit = rspamd_symcache_find_filter (cache, dep->sym, true);
+	}
+
+	if (dep->vid >= 0) {
+		/* Case of the virtual symbol that depends on another (maybe virtual) symbol */
+		vdit = rspamd_symcache_find_filter (cache, dep->sym, false);
+		msg_debug_cache ("process virtual dependency %s(%d) on %s(%d)", it->symbol,
+				dep->vid, vdit->symbol, vdit->id);
+	}
+	else {
+		vdit = dit;
+	}
+
+	if (dit != NULL) {
+		if (!dit->is_filter) {
+			/*
+			 * Check sanity:
+			 * - filters -> prefilter dependency is OK and always satisfied
+			 * - postfilter -> (filter, prefilter) dep is ok
+			 * - idempotent -> (any) dep is OK
+			 *
+			 * Otherwise, emit error
+			 * However, even if everything is fine this dep is useless ¯\_(ツ)_/¯
+			 */
+			gboolean ok_dep = FALSE;
+
+			if (it->is_filter) {
+				if (dit->type & SYMBOL_TYPE_PREFILTER) {
+					ok_dep = TRUE;
+				}
+			}
+			else if (it->type & SYMBOL_TYPE_POSTFILTER) {
+				if (dit->type & SYMBOL_TYPE_PREFILTER) {
+					ok_dep = TRUE;
+				}
+			}
+			else if (it->type & SYMBOL_TYPE_IDEMPOTENT) {
+				if (dit->type & (SYMBOL_TYPE_PREFILTER|SYMBOL_TYPE_POSTFILTER)) {
+					ok_dep = TRUE;
+				}
+			}
+			else if (it->type & SYMBOL_TYPE_PREFILTER) {
+				if (it->priority < dit->priority) {
+					/* Also OK */
+					ok_dep = TRUE;
+				}
+			}
+
+			if (!ok_dep) {
+				msg_err_cache ("cannot add dependency from %s on %s: invalid symbol types",
+						dep->sym, dit->symbol);
+
+				return;
+			}
+		}
+		else {
+			if (dit->id == it->id) {
+				msg_err_cache ("cannot add dependency on self: %s -> %s "
+							   "(resolved to %s)",
+						it->symbol, dep->sym, dit->symbol);
+			} else {
+				rdep = rspamd_mempool_alloc (cache->static_pool,
+						sizeof (*rdep));
+
+				rdep->sym = dep->sym;
+				rdep->item = it;
+				rdep->id = it->id;
+				g_assert (dit->rdeps != NULL);
+				g_ptr_array_add (dit->rdeps, rdep);
+				dep->item = dit;
+				dep->id = dit->id;
+
+				msg_debug_cache ("add dependency from %d on %d", it->id,
+						dit->id);
+			}
+		}
+	}
+	else if (dep->id >= 0) {
+		msg_err_cache ("cannot find dependency on symbol %s for symbol %s",
+				dep->sym, it->symbol);
+
+		return;
+	}
+
+	if (vdit) {
+		/* Use virtual symbol to propagate deps */
+		rspamd_symcache_propagate_dep (cache, it, vdit);
+	}
+}
+
 /* Sort items in logical order */
 static void
 rspamd_symcache_post_init (struct rspamd_symcache *cache)
 {
-	struct rspamd_symcache_item *it, *dit;
-	struct cache_dependency *dep, *rdep;
+	struct rspamd_symcache_item *it, *vit;
+	struct cache_dependency *dep;
 	struct delayed_cache_dependency *ddep;
 	struct delayed_cache_condition *dcond;
 	GList *cur;
@@ -558,6 +681,7 @@ rspamd_symcache_post_init (struct rspamd_symcache *cache)
 	while (cur) {
 		ddep = cur->data;
 
+		vit = rspamd_symcache_find_filter (cache, ddep->from, false);
 		it = rspamd_symcache_find_filter (cache, ddep->from, true);
 
 		if (it == NULL) {
@@ -565,9 +689,10 @@ rspamd_symcache_post_init (struct rspamd_symcache *cache)
 					"%s is missing", ddep->from, ddep->to, ddep->from);
 		}
 		else {
-			msg_debug_cache ("delayed between %s(%d) -> %s", ddep->from,
-					it->id, ddep->to);
-			rspamd_symcache_add_dependency (cache, it->id, ddep->to);
+			msg_debug_cache ("delayed between %s(%d:%d) -> %s", ddep->from,
+					it->id, vit->id, ddep->to);
+			rspamd_symcache_add_dependency (cache, it->id, ddep->to, vit != it ?
+																	 vit->id : -1);
 		}
 
 		cur = g_list_next (cur);
@@ -595,40 +720,7 @@ rspamd_symcache_post_init (struct rspamd_symcache *cache)
 	PTR_ARRAY_FOREACH (cache->items_by_id, i, it) {
 
 		PTR_ARRAY_FOREACH (it->deps, j, dep) {
-			dit = rspamd_symcache_find_filter (cache, dep->sym, true);
-
-			if (dit != NULL) {
-				if (!dit->is_filter) {
-					msg_err_cache ("cannot depend on non filter symbol "
-								   "(%s wants to add dependency on %s)",
-							dep->sym, dit->symbol);
-				}
-				else {
-					if (dit->id == i) {
-						msg_err_cache ("cannot add dependency on self: %s -> %s "
-									   "(resolved to %s)",
-								it->symbol, dep->sym, dit->symbol);
-					} else {
-						rdep = rspamd_mempool_alloc (cache->static_pool,
-								sizeof (*rdep));
-
-						rdep->sym = dep->sym;
-						rdep->item = it;
-						rdep->id = i;
-						g_assert (dit->rdeps != NULL);
-						g_ptr_array_add (dit->rdeps, rdep);
-						dep->item = dit;
-						dep->id = dit->id;
-
-						msg_debug_cache ("add dependency from %d on %d", it->id,
-								dit->id);
-					}
-				}
-			}
-			else {
-				msg_err_cache ("cannot find dependency on symbol %s for symbol %s",
-						dep->sym, it->symbol);
-			}
+			rspamd_symcache_process_dep (cache, it, dep);
 		}
 
 		if (it->deps) {
@@ -644,6 +736,15 @@ rspamd_symcache_post_init (struct rspamd_symcache *cache)
 		}
 	}
 
+	/* Special case for virtual symbols */
+	PTR_ARRAY_FOREACH (cache->virtual, i, it) {
+
+		PTR_ARRAY_FOREACH (it->deps, j, dep) {
+			rspamd_symcache_process_dep (cache, it, dep);
+		}
+	}
+
+	g_ptr_array_sort_with_data (cache->prefilters_empty, prefilters_cmp, cache);
 	g_ptr_array_sort_with_data (cache->prefilters, prefilters_cmp, cache);
 	g_ptr_array_sort_with_data (cache->postfilters, postfilters_cmp, cache);
 	g_ptr_array_sort_with_data (cache->idempotent, postfilters_cmp, cache);
@@ -998,8 +1099,15 @@ rspamd_symcache_add_symbol (struct rspamd_symcache *cache,
 		g_assert (parent == -1);
 
 		if (item->type & SYMBOL_TYPE_PREFILTER) {
-			g_ptr_array_add (cache->prefilters, item);
-			item->container = cache->prefilters;
+			if (item->type & SYMBOL_TYPE_EMPTY) {
+				/* Executed before mime parsing stage */
+				g_ptr_array_add (cache->prefilters_empty, item);
+				item->container = cache->prefilters_empty;
+			}
+			else {
+				g_ptr_array_add (cache->prefilters, item);
+				item->container = cache->prefilters;
+			}
 		}
 		else if (item->type & SYMBOL_TYPE_IDEMPOTENT) {
 			g_ptr_array_add (cache->idempotent, item);
@@ -1085,15 +1193,12 @@ rspamd_symcache_add_symbol (struct rspamd_symcache *cache,
 				cache->used_items, item->id);
 	}
 
-	if (item->is_filter) {
-		/* Only plain filters can have deps and rdeps */
-		item->deps = g_ptr_array_new ();
-		item->rdeps = g_ptr_array_new ();
-		rspamd_mempool_add_destructor (cache->static_pool,
-				rspamd_ptr_array_free_hard, item->deps);
-		rspamd_mempool_add_destructor (cache->static_pool,
-				rspamd_ptr_array_free_hard, item->rdeps);
-	}
+	item->deps = g_ptr_array_new ();
+	item->rdeps = g_ptr_array_new ();
+	rspamd_mempool_add_destructor (cache->static_pool,
+			rspamd_ptr_array_free_hard, item->deps);
+	rspamd_mempool_add_destructor (cache->static_pool,
+			rspamd_ptr_array_free_hard, item->rdeps);
 
 	if (name != NULL) {
 		g_hash_table_insert (cache->items_by_symbol, item->symbol, item);
@@ -1195,6 +1300,7 @@ rspamd_symcache_destroy (struct rspamd_symcache *cache)
 		rspamd_mempool_delete (cache->static_pool);
 		g_ptr_array_free (cache->filters, TRUE);
 		g_ptr_array_free (cache->prefilters, TRUE);
+		g_ptr_array_free (cache->prefilters_empty, TRUE);
 		g_ptr_array_free (cache->postfilters, TRUE);
 		g_ptr_array_free (cache->idempotent, TRUE);
 		g_ptr_array_free (cache->composites, TRUE);
@@ -1222,6 +1328,7 @@ rspamd_symcache_new (struct rspamd_config *cfg)
 	cache->items_by_id = g_ptr_array_new ();
 	cache->filters = g_ptr_array_new ();
 	cache->prefilters = g_ptr_array_new ();
+	cache->prefilters_empty = g_ptr_array_new ();
 	cache->postfilters = g_ptr_array_new ();
 	cache->idempotent = g_ptr_array_new ();
 	cache->composites = g_ptr_array_new ();
@@ -1812,9 +1919,7 @@ rspamd_symcache_make_checkpoint (struct rspamd_task *task,
 		cache->last_profile = now;
 	}
 
-	checkpoint->pass = RSPAMD_CACHE_PASS_INIT;
 	task->checkpoint = checkpoint;
-
 
 	return checkpoint;
 }
@@ -1924,7 +2029,7 @@ rspamd_symcache_process_symbols (struct rspamd_task *task,
 	struct rspamd_symcache_dynamic_item *dyn_item;
 	struct cache_savepoint *checkpoint;
 	gint i;
-	gboolean all_done;
+	gboolean all_done = TRUE;
 	gint saved_priority;
 	guint start_events_pending;
 
@@ -1938,28 +2043,17 @@ rspamd_symcache_process_symbols (struct rspamd_task *task,
 		checkpoint = task->checkpoint;
 	}
 
-	if (stage == RSPAMD_TASK_STAGE_POST_FILTERS && checkpoint->pass <
-			RSPAMD_CACHE_PASS_POSTFILTERS) {
-		checkpoint->pass = RSPAMD_CACHE_PASS_POSTFILTERS;
-	}
-
-	if (stage == RSPAMD_TASK_STAGE_IDEMPOTENT && checkpoint->pass <
-			RSPAMD_CACHE_PASS_IDEMPOTENT) {
-		checkpoint->pass = RSPAMD_CACHE_PASS_IDEMPOTENT;
-	}
-
-	msg_debug_cache_task ("symbols processing stage at pass: %d", checkpoint->pass);
+	msg_debug_cache_task ("symbols processing stage at pass: %d", stage);
 	start_events_pending = rspamd_session_events_pending (task->s);
 
-	switch (checkpoint->pass) {
-	case RSPAMD_CACHE_PASS_INIT:
-	case RSPAMD_CACHE_PASS_PREFILTERS:
+	switch (stage) {
+	case RSPAMD_TASK_STAGE_PRE_FILTERS_EMPTY:
 		/* Check for prefilters */
 		saved_priority = G_MININT;
 		all_done = TRUE;
 
-		for (i = 0; i < (gint)cache->prefilters->len; i ++) {
-			item = g_ptr_array_index (cache->prefilters, i);
+		for (i = 0; i < (gint) cache->prefilters_empty->len; i++) {
+			item = g_ptr_array_index (cache->prefilters_empty, i);
 			dyn_item = rspamd_symcache_get_dynamic (checkpoint, item);
 
 			if (RSPAMD_TASK_IS_SKIPPED (task)) {
@@ -1967,21 +2061,19 @@ rspamd_symcache_process_symbols (struct rspamd_task *task,
 			}
 
 			if (!CHECK_START_BIT (checkpoint, dyn_item) &&
-					!CHECK_FINISH_BIT (checkpoint, dyn_item)) {
+				!CHECK_FINISH_BIT (checkpoint, dyn_item)) {
 				/* Check priorities */
 				if (saved_priority == G_MININT) {
 					saved_priority = item->priority;
 				}
 				else {
 					if (item->priority < saved_priority &&
-							rspamd_session_events_pending (task->s) > start_events_pending) {
+						rspamd_session_events_pending (task->s) > start_events_pending) {
 						/*
 						 * Delay further checks as we have higher
 						 * priority filters to be processed
 						 */
-						checkpoint->pass = RSPAMD_CACHE_PASS_PREFILTERS;
-
-						return TRUE;
+						return FALSE;
 					}
 				}
 
@@ -1991,25 +2083,50 @@ rspamd_symcache_process_symbols (struct rspamd_task *task,
 			}
 		}
 
-		if (all_done || stage == RSPAMD_TASK_STAGE_FILTERS) {
-			checkpoint->pass = RSPAMD_CACHE_PASS_FILTERS;
-		}
+		break;
 
-		if (stage == RSPAMD_TASK_STAGE_FILTERS) {
-			return rspamd_symcache_process_symbols (task, cache, stage);
+	case RSPAMD_TASK_STAGE_PRE_FILTERS:
+		/* Check for prefilters */
+		saved_priority = G_MININT;
+		all_done = TRUE;
+
+		for (i = 0; i < (gint) cache->prefilters->len; i++) {
+			item = g_ptr_array_index (cache->prefilters, i);
+			dyn_item = rspamd_symcache_get_dynamic (checkpoint, item);
+
+			if (RSPAMD_TASK_IS_SKIPPED (task)) {
+				return TRUE;
+			}
+
+			if (!CHECK_START_BIT (checkpoint, dyn_item) &&
+				!CHECK_FINISH_BIT (checkpoint, dyn_item)) {
+				/* Check priorities */
+				if (saved_priority == G_MININT) {
+					saved_priority = item->priority;
+				}
+				else {
+					if (item->priority < saved_priority &&
+						rspamd_session_events_pending (task->s) > start_events_pending) {
+						/*
+						 * Delay further checks as we have higher
+						 * priority filters to be processed
+						 */
+						return FALSE;
+					}
+				}
+
+				rspamd_symcache_check_symbol (task, cache, item,
+						checkpoint);
+				all_done = FALSE;
+			}
 		}
 
 		break;
 
-	case RSPAMD_CACHE_PASS_FILTERS:
-		/*
-		 * On the first pass we check symbols that do not have dependencies
-		 * If we figure out symbol that has no dependencies satisfied, then
-		 * we just save it for another pass
-		 */
+	case RSPAMD_TASK_STAGE_FILTERS:
 		all_done = TRUE;
 
-		for (i = 0; i < (gint)checkpoint->version; i ++) {
+		for (i = 0; i < (gint) checkpoint->version; i++) {
 			if (RSPAMD_TASK_IS_SKIPPED (task)) {
 				return TRUE;
 			}
@@ -2028,7 +2145,7 @@ rspamd_symcache_process_symbols (struct rspamd_task *task,
 						checkpoint, 0, FALSE)) {
 
 					msg_debug_cache_task ("blocked execution of %d(%s) unless deps are "
-							"resolved",
+										  "resolved",
 							item->id, item->symbol);
 
 					continue;
@@ -2050,23 +2167,14 @@ rspamd_symcache_process_symbols (struct rspamd_task *task,
 			}
 		}
 
-		if (all_done || stage == RSPAMD_TASK_STAGE_POST_FILTERS) {
-			checkpoint->pass = RSPAMD_CACHE_PASS_POSTFILTERS;
-		}
-
-		if (stage == RSPAMD_TASK_STAGE_POST_FILTERS) {
-
-			return rspamd_symcache_process_symbols (task, cache, stage);
-		}
-
 		break;
 
-	case RSPAMD_CACHE_PASS_POSTFILTERS:
+	case RSPAMD_TASK_STAGE_POST_FILTERS:
 		/* Check for postfilters */
 		saved_priority = G_MININT;
 		all_done = TRUE;
 
-		for (i = 0; i < (gint)cache->postfilters->len; i ++) {
+		for (i = 0; i < (gint) cache->postfilters->len; i++) {
 			if (RSPAMD_TASK_IS_SKIPPED (task)) {
 				return TRUE;
 			}
@@ -2075,7 +2183,7 @@ rspamd_symcache_process_symbols (struct rspamd_task *task,
 			dyn_item = rspamd_symcache_get_dynamic (checkpoint, item);
 
 			if (!CHECK_START_BIT (checkpoint, dyn_item) &&
-					!CHECK_FINISH_BIT (checkpoint, dyn_item)) {
+				!CHECK_FINISH_BIT (checkpoint, dyn_item)) {
 				/* Check priorities */
 				all_done = FALSE;
 
@@ -2084,14 +2192,13 @@ rspamd_symcache_process_symbols (struct rspamd_task *task,
 				}
 				else {
 					if (item->priority > saved_priority &&
-							rspamd_session_events_pending (task->s) > start_events_pending) {
+						rspamd_session_events_pending (task->s) > start_events_pending) {
 						/*
 						 * Delay further checks as we have higher
 						 * priority filters to be processed
 						 */
-						checkpoint->pass = RSPAMD_CACHE_PASS_POSTFILTERS;
 
-						return TRUE;
+						return FALSE;
 					}
 				}
 
@@ -2100,80 +2207,42 @@ rspamd_symcache_process_symbols (struct rspamd_task *task,
 			}
 		}
 
-		if (all_done) {
-			checkpoint->pass = RSPAMD_CACHE_PASS_IDEMPOTENT;
-		}
-
-		if (checkpoint->items_inflight == 0 ||
-				stage == RSPAMD_TASK_STAGE_IDEMPOTENT) {
-			checkpoint->pass = RSPAMD_CACHE_PASS_IDEMPOTENT;
-		}
-
-		if (stage == RSPAMD_TASK_STAGE_IDEMPOTENT) {
-			return rspamd_symcache_process_symbols (task, cache, stage);
-		}
-
 		break;
 
-	case RSPAMD_CACHE_PASS_IDEMPOTENT:
+	case RSPAMD_TASK_STAGE_IDEMPOTENT:
 		/* Check for postfilters */
 		saved_priority = G_MININT;
 
-		for (i = 0; i < (gint)cache->idempotent->len; i ++) {
+		for (i = 0; i < (gint) cache->idempotent->len; i++) {
 			item = g_ptr_array_index (cache->idempotent, i);
 			dyn_item = rspamd_symcache_get_dynamic (checkpoint, item);
 
 			if (!CHECK_START_BIT (checkpoint, dyn_item) &&
-					!CHECK_FINISH_BIT (checkpoint, dyn_item)) {
+				!CHECK_FINISH_BIT (checkpoint, dyn_item)) {
 				/* Check priorities */
 				if (saved_priority == G_MININT) {
 					saved_priority = item->priority;
 				}
 				else {
 					if (item->priority > saved_priority &&
-							rspamd_session_events_pending (task->s) > start_events_pending) {
+						rspamd_session_events_pending (task->s) > start_events_pending) {
 						/*
 						 * Delay further checks as we have higher
 						 * priority filters to be processed
 						 */
-						checkpoint->pass = RSPAMD_CACHE_PASS_IDEMPOTENT;
-
-						return TRUE;
+						return FALSE;
 					}
 				}
 				rspamd_symcache_check_symbol (task, cache, item,
 						checkpoint);
 			}
 		}
-		checkpoint->pass = RSPAMD_CACHE_PASS_WAIT_IDEMPOTENT;
 		break;
-
-	case RSPAMD_CACHE_PASS_WAIT_IDEMPOTENT:
-		all_done = TRUE;
-
-		for (i = 0; i < (gint)cache->idempotent->len; i ++) {
-			item = g_ptr_array_index (cache->idempotent, i);
-			dyn_item = rspamd_symcache_get_dynamic (checkpoint, item);
-
-			if (!CHECK_FINISH_BIT (checkpoint, dyn_item)) {
-				all_done = FALSE;
-				break;
-			}
-		}
-
-		if (all_done) {
-			checkpoint->pass = RSPAMD_CACHE_PASS_DONE;
-
-			return TRUE;
-		}
-		break;
-
-	case RSPAMD_CACHE_PASS_DONE:
-		return TRUE;
-		break;
+	default:
+		g_assert_not_reached ();
 	}
 
-	return FALSE;
+	return all_done;
 }
 
 struct counters_cbdata {
@@ -2422,20 +2491,36 @@ rspamd_symcache_inc_frequency (struct rspamd_symcache *cache,
 
 void
 rspamd_symcache_add_dependency (struct rspamd_symcache *cache,
-								gint id_from, const gchar *to)
+								gint id_from, const gchar *to,
+								gint virtual_id_from)
 {
-	struct rspamd_symcache_item *source;
+	struct rspamd_symcache_item *source, *vsource;
 	struct cache_dependency *dep;
 
 	g_assert (id_from >= 0 && id_from < (gint)cache->items_by_id->len);
 
-	source = g_ptr_array_index (cache->items_by_id, id_from);
+	source = (struct rspamd_symcache_item *)g_ptr_array_index (cache->items_by_id, id_from);
 	dep = rspamd_mempool_alloc (cache->static_pool, sizeof (*dep));
 	dep->id = id_from;
 	dep->sym = rspamd_mempool_strdup (cache->static_pool, to);
 	/* Will be filled later */
 	dep->item = NULL;
+	dep->vid = -1;
 	g_ptr_array_add (source->deps, dep);
+
+	if (virtual_id_from >= 0) {
+		g_assert (virtual_id_from < (gint)cache->virtual->len);
+		/* We need that for settings id propagation */
+		vsource = (struct rspamd_symcache_item *)
+				g_ptr_array_index (cache->virtual, virtual_id_from);
+		dep = rspamd_mempool_alloc (cache->static_pool, sizeof (*dep));
+		dep->vid = virtual_id_from;
+		dep->id = -1;
+		dep->sym = rspamd_mempool_strdup (cache->static_pool, to);
+		/* Will be filled later */
+		dep->item = NULL;
+		g_ptr_array_add (vsource->deps, dep);
+	}
 }
 
 void
@@ -3094,6 +3179,10 @@ rspamd_symcache_composites_foreach (struct rspamd_task *task,
 	guint i;
 	struct rspamd_symcache_item *item;
 	struct rspamd_symcache_dynamic_item *dyn_item;
+
+	if (task->checkpoint == NULL) {
+		return;
+	}
 
 	PTR_ARRAY_FOREACH (cache->composites, i, item) {
 		dyn_item = rspamd_symcache_get_dynamic (task->checkpoint, item);

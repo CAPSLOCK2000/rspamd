@@ -360,7 +360,7 @@ return function(cfg)
   end
 
   -- Deal with IP_SCORE
-  if cfg.ip_score then
+  if cfg.ip_score and (cfg.ip_score.servers or cfg.redis.servers) then
     logger.warnx(rspamd_config, 'ip_score module is deprecated in honor of reputation module!')
 
     if not cfg.reputation then
@@ -368,6 +368,8 @@ return function(cfg)
         rules = {}
       }
     end
+
+    if not cfg.reputation.rules then cfg.reputation.rules = {} end
 
     if not fun.any(function(_, v) return v.selector and v.selector.ip end,
         cfg.reputation.rules) then
@@ -382,7 +384,11 @@ return function(cfg)
         }
       }
 
-      if cfg.symbols['IP_SCORE'] then
+      if cfg.ip_score.servers then
+        cfg.reputation.rules.ip_score.backend.redis.servers = cfg.ip_score.servers
+      end
+
+      if cfg.symbols and cfg.symbols['IP_SCORE'] then
         local t = cfg.symbols['IP_SCORE']
 
         if not cfg.symbols['SENDER_REP_SPAM'] then

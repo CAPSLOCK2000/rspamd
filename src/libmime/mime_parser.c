@@ -436,7 +436,8 @@ rspamd_mime_parse_normal_part (struct rspamd_task *task,
 
 	g_assert (part != NULL);
 
-	rspamd_mime_part_get_cte (task, part->raw_headers, part, TRUE);
+	rspamd_mime_part_get_cte (task, part->raw_headers, part,
+			!(part->ct->flags & RSPAMD_CONTENT_TYPE_MESSAGE));
 	rspamd_mime_part_get_cd (task, part);
 
 	switch (part->cte) {
@@ -1353,7 +1354,7 @@ rspamd_mime_parse_message (struct rspamd_task *task,
 				start = nst->start + start_boundary->start;
 
 				if (end > start &&
-					(ret = rspamd_mime_process_multipart_node (task, st,
+					(ret = rspamd_mime_process_multipart_node (task, nst,
 						NULL, start, end, FALSE, err)) != RSPAMD_MIME_PARSE_OK) {
 
 					if (nst != st) {
