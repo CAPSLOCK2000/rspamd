@@ -1,6 +1,7 @@
 rspamd (1.9.4~buster+uvt3) UNRELEASED; urgency=medium
 
   * Actually set sentinel_masters_pattern.
+  * Import upstream fixes.
 
  -- Casper Gielen (Unix Administrator University Tilburg) <cgielen@uvt.nl>  Thu, 22 Aug 2019 12:50:09 +0200
 
