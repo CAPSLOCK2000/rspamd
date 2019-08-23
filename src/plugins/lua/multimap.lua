@@ -434,6 +434,9 @@ local function multimap_callback(task, rule)
       return false
     end
 
+    lua_util.debugm(N, task, 'check value %s for multimap %s', value,
+        rule.symbol)
+
     local ret = false
 
     if r['cdb'] then
@@ -622,11 +625,15 @@ local function multimap_callback(task, rule)
       end
     end
 
-    if r['filter'] or r['type'] == 'url' then
-      local fn = multimap_filters[r['type']]
+    if r.filter or r.type == 'url' then
+      local fn = multimap_filters[r.type]
 
       if fn then
-        value = fn(task, r['filter'], value, r)
+
+        local filtered_value = fn(task, r.filter, value, r)
+        lua_util.debugm(N, task, 'apply filter %s for rule %s: %s -> %s',
+            r.filter, r.symbol, value, filtered_value)
+        value = filtered_value
       end
     end
 
@@ -877,6 +884,8 @@ local function multimap_callback(task, rule)
 
             if ext then
               local fake_fname = string.format('detected.%s', ext)
+              lua_util.debugm(N, task, 'detected filename %s (%s content-type)',
+                  fake_fname, detected_ct)
               match_filename(rule, fake_fname)
             end
           end
