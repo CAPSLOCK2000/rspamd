@@ -84,9 +84,17 @@ end
 exports.rspamd_str_split = rspamd_str_split
 exports.str_split = rspamd_str_split
 
-exports.rspamd_str_trim = function(s)
+local function rspamd_str_trim(s)
   return match(ptrim, s)
 end
+exports.rspamd_str_trim = rspamd_str_trim
+--[[[
+-- @function lua_util.str_trim(text)
+-- Returns a string with no trailing and leading spaces
+-- @param {string} text input text
+-- @return {string} string with no trailing and leading spaces
+--]]
+exports.str_trim = rspamd_str_trim
 
 --[[[
 -- @function lua_util.round(number, decimalPlaces)
@@ -640,8 +648,9 @@ exports.filter_specific_urls = function (urls, params)
     if params.prefix then
       cache_key = params.prefix
     else
-      cache_key = string.format('sp_urls_%d%s', params.limit,
-          tostring(params.need_emails or false))
+      cache_key = string.format('sp_urls_%d%s%s', params.limit,
+          tostring(params.need_emails or false),
+          tostring(params.need_images or false))
     end
     local cached = params.task:cache_get(cache_key)
 
@@ -653,14 +662,6 @@ exports.filter_specific_urls = function (urls, params)
   if not urls then return {} end
 
   if params.filter then urls = fun.totable(fun.filter(params.filter, urls)) end
-
-  if #urls <= params.limit and #urls <= params.esld_limit then
-    if params.task and not params.no_cache then
-      params.task:cache_set(cache_key, urls)
-    end
-
-    return urls
-  end
 
   -- Filter by tld:
   local tlds = {}
@@ -683,8 +684,12 @@ exports.filter_specific_urls = function (urls, params)
 
   local function process_single_url(u, default_priority)
     local priority = default_priority or 1 -- Normal priority
+    local flags = u:get_flags()
+    if params.ignore_ip and flags.numeric then
+      return
+    end
 
-    if u:is_redirected() then
+    if flags.redirected then
       local redir = u:get_redirected() -- get the real url
 
       if params.ignore_redirected then
@@ -697,22 +702,32 @@ exports.filter_specific_urls = function (urls, params)
       end
     end
 
+    if flags.image then
+      if not params.need_images then
+        -- Ignore url
+        return
+      else
+        -- Penalise images in urls
+        priority = 0
+      end
+    end
+
     local esld = u:get_tld()
     local str_hash = tostring(u)
 
     if esld then
       -- Special cases
-      if (u:get_protocol() ~= 'mailto') and (not u:is_html_displayed()) then
-        if u:is_obscured() then
+      if (u:get_protocol() ~= 'mailto') and (not flags.html_displayed) then
+        if flags.obscured then
           priority = 3
         else
-          if u:get_user() then
+          if (flags.has_user or flags.has_port) then
             priority = 2
-          elseif u:is_subject() or u:is_phished() then
+          elseif (flags.subject or flags.phished) then
             priority = 2
           end
         end
-      elseif u:is_html_displayed() then
+      elseif flags.html_displayed then
         priority = 0
       end
 
@@ -839,6 +854,7 @@ end
 - - filter <callback> (default = nil)
 - - prefix <string> cache prefix (default = nil)
 - - ignore_redirected <bool> (default = false)
+- - need_images <bool> (default = false)
 -- }
 -- Apply heuristic in extracting of urls from task, this function
 -- tries its best to extract specific number of urls from a task based on
@@ -850,8 +866,10 @@ exports.extract_specific_urls = function(params_or_task, lim, need_emails, filte
     limit = 9999,
     esld_limit = 9999,
     need_emails = false,
+    need_images = false,
     filter = nil,
     prefix = nil,
+    ignore_ip = false,
     ignore_redirected = false,
     no_cache = false,
   }
@@ -870,10 +888,10 @@ exports.extract_specific_urls = function(params_or_task, lim, need_emails, filte
     }
   end
   for k,v in pairs(default_params) do
-    if not params[k] then params[k] = v end
+    if type(params[k]) == 'nil' and v ~= nil then params[k] = v end
   end
 
-  local urls = params.task:get_urls(params.need_emails)
+  local urls = params.task:get_urls(params.need_emails, params.need_images)
 
   return exports.filter_specific_urls(urls, params)
 end
@@ -958,6 +976,14 @@ exports.init_debug_logging = function(config)
       end
     end
   end
+end
+
+exports.enable_debug_logging = function()
+  unconditional_debug = true
+end
+
+exports.disable_debug_logging = function()
+  unconditional_debug = false
 end
 
 --[[[
@@ -1202,25 +1228,37 @@ end
 
 ---[[[
 -- @function lua_util.table_digest(t)
--- Returns hash of all values if t[1] is string or all keys otherwise
+-- Returns hash of all values if t[1] is string or all keys/values otherwise
 -- @param {table} t input array or map
 -- @return {string} base32 representation of blake2b hash of all strings
 --]]]
-exports.table_digest = function(t)
+local function table_digest(t)
   local cr = require "rspamd_cryptobox_hash"
   local h = cr.create()
 
   if t[1] then
     for _,e in ipairs(t) do
-      h:update(tostring(e))
+      if type(e) == 'table' then
+        h:update(table_digest(e))
+      else
+        h:update(tostring(e))
+      end
     end
   else
-    for k,_ in pairs(t) do
-      h:update(k)
+    for k,v in pairs(t) do
+      h:update(tostring(k))
+
+      if type(v) == 'string' then
+        h:update(v)
+      elseif type(v) == 'table' then
+        h:update(table_digest(v))
+      end
     end
   end
  return h:base32()
 end
+
+exports.table_digest = table_digest
 
 ---[[[
 -- @function lua_util.toboolean(v)

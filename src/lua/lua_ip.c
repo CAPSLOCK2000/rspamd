@@ -490,7 +490,7 @@ lua_ip_equal (lua_State *L)
 	gboolean res = FALSE;
 
 	if (ip1 && ip2 && ip1->addr && ip2->addr) {
-		res = rspamd_inet_address_compare (ip1->addr, ip2->addr, TRUE);
+		res = rspamd_inet_address_compare (ip1->addr, ip2->addr, TRUE) == 0;
 	}
 
 	lua_pushboolean (L, res);
@@ -584,17 +584,7 @@ lua_load_ip (lua_State * L)
 void
 luaopen_ip (lua_State * L)
 {
-	luaL_newmetatable (L, "rspamd{ip}");
-	lua_pushstring (L, "__index");
-	lua_pushvalue (L, -2);
-	lua_settable (L, -3);
-
-	lua_pushstring (L, "class");
-	lua_pushstring (L, "rspamd{ip}");
-	lua_rawset (L, -3);
-
-	luaL_register (L, NULL,		   iplib_m);
-	rspamd_lua_add_preload (L, "rspamd_ip", lua_load_ip);
-
+	rspamd_lua_new_class (L, "rspamd{ip}", iplib_m);
 	lua_pop (L, 1);
+	rspamd_lua_add_preload (L, "rspamd_ip", lua_load_ip);
 }

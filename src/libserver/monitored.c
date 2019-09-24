@@ -199,6 +199,30 @@ struct rspamd_dns_monitored_conf {
 	gdouble check_tm;
 };
 
+static void
+rspamd_monitored_dns_random (struct rspamd_monitored *m,
+							 struct rspamd_dns_monitored_conf *conf)
+{
+	gchar random_prefix[32];
+	const gchar dns_chars[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
+	gint len;
+
+	len = rspamd_random_uint64_fast () % sizeof (random_prefix);
+
+	if (len < 8) {
+		len = 8;
+	}
+
+	for (guint i = 0; i < len; i ++) {
+		guint idx = rspamd_random_uint64_fast () % (sizeof (dns_chars) - 1);
+		random_prefix[i] = dns_chars[idx];
+	}
+
+	conf->request->len = 0;
+	rspamd_printf_gstring (conf->request, "%*.s.%s", len, random_prefix,
+			m->url);
+}
+
 static void *
 rspamd_monitored_dns_conf (struct rspamd_monitored *m,
 		struct rspamd_monitored_ctx *ctx,
@@ -229,10 +253,13 @@ rspamd_monitored_dns_conf (struct rspamd_monitored *m,
 			}
 		}
 
-		elt = ucl_object_lookup (opts, "prefix");
+		if (!(m->flags & RSPAMD_MONITORED_RANDOM)) {
+			/* Prefix is useless for random monitored */
+			elt = ucl_object_lookup (opts, "prefix");
 
-		if (elt && ucl_object_type (elt) == UCL_STRING) {
-			rspamd_printf_gstring (req, "%s.", ucl_object_tostring (elt));
+			if (elt && ucl_object_type (elt) == UCL_STRING) {
+				rspamd_printf_gstring (req, "%s.", ucl_object_tostring (elt));
+			}
 		}
 
 		elt = ucl_object_lookup (opts, "ipnet");
@@ -267,7 +294,10 @@ rspamd_monitored_dns_conf (struct rspamd_monitored *m,
 		}
 	}
 
-	rspamd_printf_gstring (req, "%s", m->url);
+	if (!(m->flags & RSPAMD_MONITORED_RANDOM)) {
+		rspamd_printf_gstring (req, "%s", m->url);
+	}
+
 	conf->request = req;
 
 	return conf;
@@ -378,10 +408,15 @@ rspamd_monitored_dns_mon (struct rspamd_monitored *m,
 {
 	struct rspamd_dns_monitored_conf *conf = ud;
 
+	if (m->flags & RSPAMD_MONITORED_RANDOM) {
+		rspamd_monitored_dns_random (m, conf);
+	}
+
 	if (!rdns_make_request_full (ctx->resolver, rspamd_monitored_dns_cb,
 			conf, ctx->cfg->dns_timeout, ctx->cfg->dns_retransmits,
 			1, conf->request->str, conf->rt)) {
-		msg_notice_mon ("cannot make request to resolve %s", conf->request->str);
+		msg_notice_mon ("cannot make request to resolve %s (%s monitored url)",
+				conf->request->str, conf->m->url);
 
 		m->cur_errors ++;
 		rspamd_monitored_propagate_error (m, "failed to make DNS request");
@@ -478,11 +513,11 @@ rspamd_monitored_create_ (struct rspamd_monitored_ctx *ctx,
 	gchar *cksum_encoded, cksum[rspamd_cryptobox_HASHBYTES];
 
 	g_assert (ctx != NULL);
-	g_assert (line != NULL);
 
 	m = g_malloc0 (sizeof (*m));
 	m->type = type;
 	m->flags = flags;
+
 	m->url = g_strdup (line);
 	m->ctx = ctx;
 	m->monitoring_mult = 1.0;
@@ -498,6 +533,18 @@ rspamd_monitored_create_ (struct rspamd_monitored_ctx *ctx,
 		g_free (m);
 
 		return NULL;
+	}
+
+	if (opts) {
+		const ucl_object_t *rnd_obj;
+
+		rnd_obj = ucl_object_lookup (opts, "random");
+
+		if (rnd_obj && ucl_object_type (rnd_obj) == UCL_BOOLEAN) {
+			if (ucl_object_toboolean (rnd_obj)) {
+				m->flags |= RSPAMD_MONITORED_RANDOM;
+			}
+		}
 	}
 
 	m->proc.ud = m->proc.monitored_config (m, ctx, opts);
@@ -606,7 +653,7 @@ rspamd_monitored_start (struct rspamd_monitored *m)
 	jittered = rspamd_time_jitter (m->ctx->monitoring_interval * m->monitoring_mult,
 			0.0);
 
-	if (ev_is_active (&m->periodic)) {
+	if (ev_can_stop (&m->periodic)) {
 		ev_timer_stop (m->ctx->event_loop, &m->periodic);
 	}
 

@@ -33,6 +33,7 @@ enum rspamd_url_flags {
 	RSPAMD_URL_FLAG_UNNORMALISED = 1u << 16u,
 	RSPAMD_URL_FLAG_ZW_SPACES = 1u << 17u,
 	RSPAMD_URL_FLAG_DISPLAY_URL = 1u << 18u,
+	RSPAMD_URL_FLAG_IMAGE = 1u << 19u,
 };
 
 struct rspamd_url_tag {
@@ -51,7 +52,6 @@ struct rspamd_url {
 	gchar *data;
 	gchar *query;
 	gchar *fragment;
-	gchar *surbl;
 	gchar *tld;
 	gchar *visible_part;
 
@@ -63,7 +63,6 @@ struct rspamd_url {
 	guint datalen;
 	guint querylen;
 	guint fragmentlen;
-	guint surbllen;
 	guint tldlen;
 	guint urllen;
 	guint rawlen;

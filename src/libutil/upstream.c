@@ -172,7 +172,7 @@ rspamd_upstreams_library_config (struct rspamd_config *cfg,
 
 		while (cur) {
 			upstream = cur->data;
-			if (!ev_is_active (&upstream->ev) && upstream->ls &&
+			if (!ev_can_stop (&upstream->ev) && upstream->ls &&
 						!(upstream->flags & RSPAMD_UPSTREAM_FLAG_NORESOLVE)) {
 				gdouble when = rspamd_time_jitter (upstream->ls->limits.lazy_resolve_time,
 						upstream->ls->limits.lazy_resolve_time * .1);
@@ -281,7 +281,7 @@ rspamd_upstream_set_active (struct upstream_list *ls, struct upstream *upstream)
 	if (upstream->ctx && upstream->ctx->configured &&
 		!(upstream->flags & RSPAMD_UPSTREAM_FLAG_NORESOLVE)) {
 
-		if (ev_is_active (&upstream->ev)) {
+		if (ev_can_stop (&upstream->ev)) {
 			ev_timer_stop (upstream->ctx->event_loop, &upstream->ev);
 		}
 		/* Start lazy names resolution */
@@ -450,6 +450,7 @@ rspamd_upstream_revive_cb (struct ev_loop *loop, ev_timer *w, int revents)
 	}
 
 	RSPAMD_UPSTREAM_UNLOCK (upstream->lock);
+	g_assert (upstream->ref.refcount > 1);
 	REF_RELEASE (upstream);
 }
 
@@ -525,7 +526,7 @@ rspamd_upstream_set_inactive (struct upstream_list *ls, struct upstream *upstrea
 		ntim = rspamd_time_jitter (ls->limits.revive_time,
 				ls->limits.revive_jitter);
 
-		if (ev_is_active (&upstream->ev)) {
+		if (ev_can_stop (&upstream->ev)) {
 			ev_timer_stop (upstream->ctx->event_loop, &upstream->ev);
 		}
 
@@ -721,7 +722,7 @@ rspamd_upstream_dtor (struct upstream *up)
 
 	if (up->ctx) {
 
-		if (ev_is_active (&up->ev)) {
+		if (ev_can_stop (&up->ev)) {
 			ev_timer_stop (up->ctx->event_loop, &up->ev);
 		}
 
@@ -1030,7 +1031,7 @@ rspamd_upstream_restore_cb (gpointer elt, gpointer ls)
 	/* Here the upstreams list is already locked */
 	RSPAMD_UPSTREAM_LOCK (up->lock);
 
-	if (ev_is_active (&up->ev)) {
+	if (ev_can_stop (&up->ev)) {
 		ev_timer_stop (up->ctx->event_loop, &up->ev);
 	}
 
@@ -1045,6 +1046,7 @@ rspamd_upstream_restore_cb (gpointer elt, gpointer ls)
 	}
 
 	/* For revive event */
+	g_assert (up->ref.refcount > 1);
 	REF_RELEASE (up);
 }
 

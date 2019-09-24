@@ -128,7 +128,7 @@ rspamd_config_new (enum rspamd_config_init_flags flags)
 	cfg = g_malloc0 (sizeof (*cfg));
 	/* Allocate larger pool for cfg */
 	cfg->cfg_pool = rspamd_mempool_new (8 * 1024 * 1024, "cfg");
-	cfg->dns_timeout = 1000;
+	cfg->dns_timeout = 1.0;
 	cfg->dns_retransmits = 5;
 	/* 16 sockets per DNS server */
 	cfg->dns_io_per_server = 16;
@@ -233,6 +233,7 @@ rspamd_config_new (enum rspamd_config_init_flags flags)
 	cfg->max_sessions_cache = DEFAULT_MAX_SESSIONS;
 	cfg->maps_cache_dir = rspamd_mempool_strdup (cfg->cfg_pool, RSPAMD_DBDIR);
 	cfg->c_modules = g_ptr_array_new ();
+	cfg->heartbeat_interval = 10.0;
 
 	REF_INIT_RETAIN (cfg, rspamd_config_free);
 
@@ -450,6 +451,12 @@ rspamd_config_process_var (struct rspamd_config *cfg, const rspamd_ftok_t *var,
 	else if (rspamd_ftok_cstr_equal (&tok, "symbols_scores_params", TRUE)) {
 		type = RSPAMD_LOG_SYMBOLS;
 		flags |= RSPAMD_LOG_FMT_FLAG_SYMBOLS_PARAMS|RSPAMD_LOG_FMT_FLAG_SYMBOLS_SCORES;
+	}
+	else if (rspamd_ftok_cstr_equal (&tok, "groups", TRUE)) {
+		type = RSPAMD_LOG_GROUPS;
+	}
+	else if (rspamd_ftok_cstr_equal (&tok, "public_groups", TRUE)) {
+		type = RSPAMD_LOG_PUBLIC_GROUPS;
 	}
 	else if (rspamd_ftok_cstr_equal (&tok, "ip", TRUE)) {
 		type = RSPAMD_LOG_IP;
@@ -1555,16 +1562,21 @@ rspamd_config_new_symbol (struct rspamd_config *cfg, const gchar *symbol,
 	score_ptr = rspamd_mempool_alloc (cfg->cfg_pool, sizeof (gdouble));
 
 	if (isnan (score)) {
-		msg_warn_config ("score is not defined for symbol %s, set it to zero",
+		/* In fact, it could be defined later */
+		msg_debug_config ("score is not defined for symbol %s, set it to zero",
 				symbol);
 		score = 0.0;
+		/* Also set priority to 0 to allow override by anything */
+		sym_def->priority = 0;
+	}
+	else {
+		sym_def->priority = priority;
 	}
 
 	*score_ptr = score;
 	sym_def->score = score;
 	sym_def->weight_ptr = score_ptr;
 	sym_def->name = rspamd_mempool_strdup (cfg->cfg_pool, symbol);
-	sym_def->priority = priority;
 	sym_def->flags = flags;
 	sym_def->nshots = nshots;
 	sym_def->groups = g_ptr_array_sized_new (1);
