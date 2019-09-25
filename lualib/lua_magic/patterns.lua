@@ -129,6 +129,15 @@ local patterns = {
       },
     }
   },
+  bat = {
+    matches = {
+      {
+        string = [[(?i)@\s*ECHO\s+OFF]],
+        position = {'>=', 0},
+        weight = 60,
+      },
+    }
+  },
   class = {
     -- Technically, this also matches MachO files, but I don't care about
     -- Apple and their mental health problems here: just consider Java files,
@@ -378,6 +387,47 @@ local patterns = {
         position = 6,
         weight = 60,
       }
+    }
+  },
+  jpg = {
+    matches = {
+      { -- JPEG2000
+        hex = [[0000000c6a5020200d0a870a]],
+        relative_position = 0,
+        weight = 60,
+      },
+      {
+        string = [[^\x{ff}\x{d8}\x{ff}]],
+        weight = 60,
+        position = 3,
+      },
+    },
+  },
+  png = {
+    matches = {
+      {
+        string = [[^\x{89}PNG\x{0d}\x{0a}\x{1a}\x{0a}]],
+        position = 8,
+        weight = 60,
+      },
+    }
+  },
+  gif = {
+    matches = {
+      {
+        string = [[^GIF8\d]],
+        position = 5,
+        weight = 60,
+      },
+    }
+  },
+  bmp = {
+    matches = {
+      {
+        string = [[^BM...\x{00}\x{00}\x{00}\x{00}]],
+        position = 9,
+        weight = 60,
+      },
     }
   },
 }

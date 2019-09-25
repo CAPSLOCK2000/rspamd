@@ -39,6 +39,18 @@ local types = {
     ct = 'application/x-java-applet',
     type = 'executable',
   },
+  jar = {
+    ct = 'application/java-archive',
+    type = 'archive',
+  },
+  apk = {
+    ct = 'application/vnd.android.package-archive',
+    type = 'archive',
+  },
+  bat = {
+    ct = 'application/x-bat',
+    type = 'executable',
+  },
   -- text
   rtf = {
     ct = "application/rtf",

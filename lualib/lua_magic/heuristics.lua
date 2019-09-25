@@ -244,7 +244,8 @@ local function detect_archive_flaw(part, arch, log_obj)
     jar = 0,
     odt = 0,
     odp = 0,
-    ods = 0
+    ods = 0,
+    apk = 0,
   } -- ext + confidence pairs
 
   -- General msoffice patterns
@@ -268,6 +269,8 @@ local function detect_archive_flaw(part, arch, log_obj)
         res.pptx = res.pptx + 30
       elseif file == 'META-INF/MANIFEST.MF' then
         res.jar = res.jar + 40
+      elseif file == 'AndroidManifest.xml' then
+        res.apk = res.apk + 60
       end
     end
 
@@ -300,15 +303,6 @@ local function detect_archive_flaw(part, arch, log_obj)
 end
 
 exports.mime_part_heuristic = function(part, log_obj)
-
-  if part:is_image() then
-    local img = part:get_image()
-    local img_type = img:get_type():lower()
-
-    if img_type == 'jpeg' then img_type = 'jpg' end
-    return img_type,60
-  end
-
   if part:is_archive() then
     local arch = part:get_archive()
     return detect_archive_flaw(part, arch, log_obj)
