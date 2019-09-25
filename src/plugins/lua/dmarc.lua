@@ -49,13 +49,12 @@ local report_settings = {
 local report_template = [[From: "{% from_name %}" <{% from_addr %}>
 To: {% rcpt %}
 Subject: Report Domain: {% reporting_domain %}
-	Submitter: {% submitter %}
-	Report-ID: {% report_id %}
+Submitter: {% submitter %}
+Report-ID: {% report_id %}
 Date: {% report_date %}
 MIME-Version: 1.0
 Message-ID: <{% message_id %}>
-Content-Type: multipart/mixed;
-	boundary="----=_NextPart_000_024E_01CC9B0A.AFE54C00"
+Content-Type: multipart/mixed; boundary="----=_NextPart_000_024E_01CC9B0A.AFE54C00"
 
 This is a multipart message in MIME format.
 
